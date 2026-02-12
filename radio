@@ -104,16 +104,24 @@ STATION_CURSOR=-1  # -1 = on category header, 0+ = station index within expanded
 RECONNECT_ATTEMPTS=0
 MAX_RECONNECT=3
 CATEGORY_LIST=()
+CATEGORY_COUNTS=()
 EXPANDED_STATIONS=()
 SAVED_STTY=""
 VOLUME=""
-LEVEL_FILE=""
-VU_BUFFER=""
-VU_DISPLAY=""
+DISPLAY_FILE=""
+WAVE_PID=""
+WAVE_DISPLAY_TOP=""
+WAVE_DISPLAY_BOT=""
+WAVE_COL=48
 RENDER_ROW=0
 PAUSED=0
-
-VU_BLOCKS=(" " "▁" "▂" "▃" "▄" "▅" "▆" "▇")
+RESIZE_PENDING=0
+VU_WIDTH=20
+TERM_WIDTH=80
+TERM_HEIGHT=24
+FRAME_COUNT=0
+TIMER_PID=""
+OUT=""
 
 # Terminal colors and formatting
 BOLD=$'\033[1m'
@@ -130,22 +138,23 @@ BLUE=$'\033[34m'
 # ---------------------------------------------------------------------------
 # Utility functions
 # ---------------------------------------------------------------------------
+update_terminal_size() {
+    TERM_WIDTH=$(tput cols 2>/dev/null) || TERM_WIDTH=80
+    TERM_HEIGHT=$(tput lines 2>/dev/null) || TERM_HEIGHT=24
+}
+
 get_terminal_width() {
-    local cols
-    cols=$(tput cols 2>/dev/null) || cols=80
-    echo "$cols"
+    echo "$TERM_WIDTH"
 }
 
 get_terminal_height() {
-    local rows
-    rows=$(tput lines 2>/dev/null) || rows=24
-    echo "$rows"
+    echo "$TERM_HEIGHT"
 }
 
 hide_cursor() { printf '\033[?25l'; }
 show_cursor() { printf '\033[?25h'; }
 clear_screen() { printf '\033[2J\033[H'; }
-move_to() { printf '\033[%d;%dH' "$1" "$2"; }
+move_to() { printf -v _f '\033[%d;%dH' "$1" "$2"; OUT+="$_f"; }
 
 draw_horizontal_line() {
     local width="$1"
@@ -158,19 +167,17 @@ draw_horizontal_line() {
 }
 
 erase_below() {
-    local from_row=$1
-    local height
-    height=$(get_terminal_height)
-    local row
-    for ((row = from_row; row < height; row++)); do
-        move_to "$row" 1
-        printf '\033[K'
+    local row=$1
+    while [[ $row -lt $TERM_HEIGHT ]]; do
+        OUT+=$'\033['"${row};1H"$'\033[K'
+        ((row++))
     done
 }
 
 build_category_list() {
     CATEGORY_LIST=()
-    local i seen
+    CATEGORY_COUNTS=()
+    local i seen count
     for i in "${!STATION_CATEGORIES[@]}"; do
         seen=0
         for existing in "${CATEGORY_LIST[@]}"; do
@@ -181,6 +188,13 @@ build_category_list() {
         done
         if [[ $seen -eq 0 ]]; then
             CATEGORY_LIST+=("${STATION_CATEGORIES[$i]}")
+            count=0
+            for k in "${!STATION_CATEGORIES[@]}"; do
+                if [[ "${STATION_CATEGORIES[$k]}" == "${STATION_CATEGORIES[$i]}" ]]; then
+                    ((count++))
+                fi
+            done
+            CATEGORY_COUNTS+=("$count")
         fi
     done
 }
@@ -196,17 +210,6 @@ expand_current_category() {
     done
 }
 
-count_category_stations() {
-    local category="$1"
-    local count=0
-    local i
-    for i in "${!STATION_CATEGORIES[@]}"; do
-        if [[ "${STATION_CATEGORIES[$i]}" == "$category" ]]; then
-            ((count++))
-        fi
-    done
-    echo "$count"
-}
 
 # ---------------------------------------------------------------------------
 # Volume control (macOS system volume via osascript)
@@ -228,54 +231,54 @@ adjust_volume() {
 }
 
 # ---------------------------------------------------------------------------
-# VU meter
+# Waveform
 # ---------------------------------------------------------------------------
-read_audio_level() {
-    if [[ -z "$CURRENT_PID" ]] || [[ ! -s "$LEVEL_FILE" ]]; then
+read_waveform() {
+    WAVE_DISPLAY_TOP=""
+    WAVE_DISPLAY_BOT=""
+    if [[ -z "$WAVE_PID" ]] || [[ $VU_WIDTH -eq 0 ]]; then
         return
     fi
-    local last_rms
-    last_rms=$(tail -5 "$LEVEL_FILE" 2>/dev/null | grep "RMS_level" | tail -1)
-    if [[ -z "$last_rms" ]]; then
+    if [[ ! -s "$DISPLAY_FILE" ]]; then
         return
     fi
-    local db_str="${last_rms##*=}"
-    local level=0
-    if [[ "$db_str" == "-inf" ]] || [[ "$db_str" == "inf" ]]; then
-        level=0
-    else
-        local db_int="${db_str%%.*}"
-        if [[ $db_int -ge -10 ]]; then level=7
-        elif [[ $db_int -ge -18 ]]; then level=6
-        elif [[ $db_int -ge -25 ]]; then level=5
-        elif [[ $db_int -ge -30 ]]; then level=4
-        elif [[ $db_int -ge -40 ]]; then level=3
-        elif [[ $db_int -ge -50 ]]; then level=2
-        elif [[ $db_int -ge -60 ]]; then level=1
-        fi
+    local content
+    content=$(<"$DISPLAY_FILE") 2>/dev/null || return
+    if [[ -z "$content" ]]; then
+        return
     fi
-    VU_BUFFER="${VU_BUFFER}${level}"
-    if [[ ${#VU_BUFFER} -gt 20 ]]; then
-        VU_BUFFER="${VU_BUFFER:$((${#VU_BUFFER}-20))}"
+    local top_line="${content%%$'\n'*}"
+    local bot_line="${content#*$'\n'}"
+    if [[ "$bot_line" == "$content" ]]; then
+        bot_line=""
+    fi
+    local top_len=${#top_line}
+    if [[ $top_len -gt $VU_WIDTH ]]; then
+        top_line="${top_line:$((top_len - VU_WIDTH))}"
+    fi
+    local bot_len=${#bot_line}
+    if [[ $bot_len -gt $VU_WIDTH ]]; then
+        bot_line="${bot_line:$((bot_len - VU_WIDTH))}"
+    fi
+    WAVE_DISPLAY_TOP="${GREEN}${top_line}${RESET}"
+    WAVE_DISPLAY_BOT="${GREEN}${bot_line}${RESET}"
+}
+
+calculate_vu_width() {
+    if [[ $TERM_WIDTH -lt 55 ]]; then
+        VU_WIDTH=0
+        return
+    fi
+    VU_WIDTH=$((TERM_WIDTH - WAVE_COL))
+    if [[ $VU_WIDTH -lt 5 ]]; then
+        VU_WIDTH=5
+    elif [[ $VU_WIDTH -gt 200 ]]; then
+        VU_WIDTH=200
     fi
 }
 
-format_vu_meter() {
-    VU_DISPLAY=""
-    if [[ -z "$VU_BUFFER" ]] || [[ -z "$CURRENT_PID" ]]; then
-        return
-    fi
-    local result=""
-    local i level
-    for ((i = 0; i < ${#VU_BUFFER}; i++)); do
-        level="${VU_BUFFER:$i:1}"
-        result+="${VU_BLOCKS[$level]}"
-    done
-    VU_DISPLAY="${GREEN}${result}${RESET}"
-}
-
 # ---------------------------------------------------------------------------
-# Playback (ffmpeg with astats for VU data, audiotoolbox for audio output)
+# Playback (two ffmpeg processes: audiotoolbox for audio, u8 PCM for waveform)
 # ---------------------------------------------------------------------------
 stop_playback() {
     if [[ -n "$CURRENT_PID" ]] && kill -0 "$CURRENT_PID" 2>/dev/null; then
@@ -283,15 +286,24 @@ stop_playback() {
             kill -CONT "$CURRENT_PID" 2>/dev/null
         fi
         kill "$CURRENT_PID" 2>/dev/null
-        wait "$CURRENT_PID" 2>/dev/null
+    fi
+    if [[ -n "$WAVE_PID" ]] && kill -0 "$WAVE_PID" 2>/dev/null; then
+        if [[ $PAUSED -eq 1 ]]; then
+            kill -CONT "$WAVE_PID" 2>/dev/null
+        fi
+        kill "$WAVE_PID" 2>/dev/null
+    fi
+    if [[ -n "$CURRENT_PID" ]] || [[ -n "$WAVE_PID" ]]; then
+        sleep 0.05
     fi
     CURRENT_PID=""
+    WAVE_PID=""
     RECONNECT_ATTEMPTS=0
     PAUSED=0
-    VU_BUFFER=""
-    VU_DISPLAY=""
-    if [[ -n "$LEVEL_FILE" ]] && [[ -f "$LEVEL_FILE" ]]; then
-        : > "$LEVEL_FILE"
+    WAVE_DISPLAY_TOP=""
+    WAVE_DISPLAY_BOT=""
+    if [[ -n "$DISPLAY_FILE" ]]; then
+        rm -f "$DISPLAY_FILE" "${DISPLAY_FILE}.tmp" "${DISPLAY_FILE}.pid" 2>/dev/null
     fi
 }
 
@@ -301,9 +313,15 @@ toggle_pause() {
     fi
     if [[ $PAUSED -eq 0 ]]; then
         kill -STOP "$CURRENT_PID" 2>/dev/null
+        if [[ -n "$WAVE_PID" ]] && kill -0 "$WAVE_PID" 2>/dev/null; then
+            kill -STOP "$WAVE_PID" 2>/dev/null
+        fi
         PAUSED=1
     else
         kill -CONT "$CURRENT_PID" 2>/dev/null
+        if [[ -n "$WAVE_PID" ]] && kill -0 "$WAVE_PID" 2>/dev/null; then
+            kill -CONT "$WAVE_PID" 2>/dev/null
+        fi
         PAUSED=0
     fi
 }
@@ -312,29 +330,44 @@ start_playback() {
     local index="$1"
     stop_playback
     local url="${STATION_URLS[$index]}"
-    ffmpeg -loglevel quiet -i "$url" \
-        -af "astats=metadata=1:reset=1,ametadata=print:key=lavfi.astats.Overall.RMS_level:file=$LEVEL_FILE" \
-        -f audiotoolbox - 2>/dev/null &
-    CURRENT_PID=$!
+    local pid_file="${DISPLAY_FILE}.pid"
+    sh -c 'printf "%d" "$$" > "$1"; exec ffmpeg -loglevel quiet -nostdin -i "$2" -f audiotoolbox - -ac 1 -ar 8000 -f u8 pipe:1' \
+        _ "$pid_file" "$url" </dev/null 2>/dev/null | \
+        perl "$WAVE_SCRIPT" "$DISPLAY_FILE" >/dev/null 2>&1 &
+    WAVE_PID=$!
+    disown
+    sleep 0.05
+    [[ -s "$pid_file" ]] && CURRENT_PID=$(<"$pid_file")
+    rm -f "$pid_file" 2>/dev/null
     CURRENT_STATION_INDEX="$index"
     RECONNECT_ATTEMPTS=0
-    VU_BUFFER=""
 }
 
 check_playback() {
     if [[ -n "$CURRENT_PID" ]] && ! kill -0 "$CURRENT_PID" 2>/dev/null; then
+        if [[ -n "$WAVE_PID" ]] && kill -0 "$WAVE_PID" 2>/dev/null; then
+            kill "$WAVE_PID" 2>/dev/null
+            sleep 0.05
+            WAVE_PID=""
+        fi
         if [[ $RECONNECT_ATTEMPTS -lt $MAX_RECONNECT ]]; then
             ((RECONNECT_ATTEMPTS++))
             local url="${STATION_URLS[$CURRENT_STATION_INDEX]}"
-            ffmpeg -loglevel quiet -i "$url" \
-                -af "astats=metadata=1:reset=1,ametadata=print:key=lavfi.astats.Overall.RMS_level:file=$LEVEL_FILE" \
-                -f audiotoolbox - 2>/dev/null &
-            CURRENT_PID=$!
+            local pid_file="${DISPLAY_FILE}.pid"
+            sh -c 'printf "%d" "$$" > "$1"; exec ffmpeg -loglevel quiet -nostdin -i "$2" -f audiotoolbox - -ac 1 -ar 8000 -f u8 pipe:1' \
+                _ "$pid_file" "$url" </dev/null 2>/dev/null | \
+                perl "$WAVE_SCRIPT" "$DISPLAY_FILE" >/dev/null 2>&1 &
+            WAVE_PID=$!
+            disown
+            sleep 0.05
+            [[ -s "$pid_file" ]] && CURRENT_PID=$(<"$pid_file")
+            rm -f "$pid_file" 2>/dev/null
         else
             CURRENT_PID=""
+            WAVE_PID=""
             CURRENT_STATION_INDEX=""
-            VU_BUFFER=""
-            VU_DISPLAY=""
+            WAVE_DISPLAY_TOP=""
+            WAVE_DISPLAY_BOT=""
         fi
     fi
 }
@@ -343,8 +376,7 @@ check_playback() {
 # Rendering (flicker-free: move_to + erase-to-end-of-line, no clear_screen)
 # ---------------------------------------------------------------------------
 render_header() {
-    local width
-    width=$(get_terminal_width)
+    local width=$TERM_WIDTH
     move_to 1 1
 
     local title=" RADIO"
@@ -366,22 +398,19 @@ render_header() {
     local padding=$((width - ${#left} - ${#right}))
     if [[ $padding -lt 0 ]]; then padding=0; fi
 
-    printf '%s' "${REVERSE}${BOLD}"
-    printf '%s' "$left"
-    printf '%*s' "$padding" ""
+    printf -v _f '%s%s%*s' "${REVERSE}${BOLD}${left}" "" "$padding" ""
+    OUT+="$_f"
     if [[ -n "$right" ]]; then
-        printf '%s%s' "${GREEN}${REVERSE}" "$right"
+        OUT+="${GREEN}${REVERSE}${right}"
     fi
-    printf '%s\033[K' "${RESET}"
+    OUT+="${RESET}"$'\033[K'
 
     RENDER_ROW=3
 }
 
 render_footer() {
-    local width
-    width=$(get_terminal_width)
-    local height
-    height=$(get_terminal_height)
+    local width=$TERM_WIDTH
+    local height=$TERM_HEIGHT
     move_to "$height" 1
 
     local hints=" j/k:nav  enter:select  b:back  s:stop  p:pause  +/-:vol  q:quit"
@@ -389,15 +418,15 @@ render_footer() {
     local padding=$((width - ${#hints}))
     if [[ $padding -lt 0 ]]; then padding=0; fi
 
-    printf '%s%s%*s%s' "${REVERSE}${DIM}" "$hints" "$padding" "" "${RESET}"
+    printf -v _f '%s%s%*s%s' "${REVERSE}${DIM}" "$hints" "$padding" "" "${RESET}"
+    OUT+="$_f"
 }
 
 render_list() {
     local cat_idx
     for cat_idx in "${!CATEGORY_LIST[@]}"; do
         local category="${CATEGORY_LIST[$cat_idx]}"
-        local station_count
-        station_count=$(count_category_stations "$category")
+        local station_count="${CATEGORY_COUNTS[$cat_idx]}"
         local is_current_cat=0
         if [[ $cat_idx -eq $CATEGORY_CURSOR ]]; then
             is_current_cat=1
@@ -410,14 +439,16 @@ render_list() {
 
         move_to "$RENDER_ROW" 1
         if [[ $is_current_cat -eq 1 ]] && [[ $STATION_CURSOR -eq -1 ]]; then
-            printf '  %s %s%s %-28s%s  %s%d%s\033[K' \
+            printf -v _f '  %s %s%s %-28s%s  %s%d%s' \
                 "${CYAN}>${RESET}" \
                 "${BOLD}${WHITE}" "$expand_marker" "$category" "${RESET}" \
                 "${DIM}" "$station_count" "${RESET}"
+            OUT+="$_f"$'\033[K'
         else
-            printf '   %s %-28s  %s%d%s\033[K' \
+            printf -v _f '   %s %-28s  %s%d%s' \
                 "$expand_marker" "$category" \
                 "${DIM}" "$station_count" "${RESET}"
+            OUT+="$_f"$'\033[K'
         fi
         ((RENDER_ROW++))
 
@@ -429,36 +460,54 @@ render_list() {
                 local desc="${STATION_DESCS[$station_idx]}"
                 local quality="${STATION_QUALITY[$station_idx]}"
                 local playing_marker=""
-                local vu_segment=""
+                local is_playing=0
 
                 if [[ "$station_idx" == "$CURRENT_STATION_INDEX" ]]; then
+                    is_playing=1
                     if [[ $PAUSED -eq 1 ]]; then
                         playing_marker="${YELLOW} ▐▐${RESET}"
                     else
                         playing_marker="${GREEN} ▶${RESET}"
                     fi
-                    if [[ -n "$VU_DISPLAY" ]]; then
-                        vu_segment=" ${VU_DISPLAY}"
-                    fi
                 fi
 
                 move_to "$RENDER_ROW" 1
                 if [[ $s_idx -eq $STATION_CURSOR ]]; then
-                    printf '    %s %s%-30s%s %s%-7s%s%s%s\033[K' \
+                    printf -v _f '    %s %s%-30s%s %s%-7s%s%s' \
                         "${CYAN}>${RESET}" \
                         "${BOLD}${WHITE}" "$name" "${RESET}" \
                         "${YELLOW}" "$quality" "${RESET}" \
-                        "$playing_marker" \
-                        "$vu_segment"
+                        "$playing_marker"
+                    OUT+="$_f"$'\033[K'
+                    if [[ $is_playing -eq 1 ]] && [[ -n "$WAVE_DISPLAY_TOP" ]]; then
+                        printf -v _f '\033[%dG%s' "$WAVE_COL" "$WAVE_DISPLAY_TOP"
+                        OUT+="$_f"
+                    fi
                     ((RENDER_ROW++))
                     move_to "$RENDER_ROW" 1
-                    printf '      %s%s%s\033[K' "${DIM}" "$desc" "${RESET}"
+                    printf -v _f '      %s%s%s' "${DIM}" "$desc" "${RESET}"
+                    OUT+="$_f"$'\033[K'
+                    if [[ $is_playing -eq 1 ]] && [[ -n "$WAVE_DISPLAY_BOT" ]]; then
+                        printf -v _f '\033[%dG%s' "$WAVE_COL" "$WAVE_DISPLAY_BOT"
+                        OUT+="$_f"
+                    fi
                 else
-                    printf '     %-30s %s%-7s%s%s%s\033[K' \
+                    printf -v _f '     %-30s %s%-7s%s%s' \
                         "$name" \
                         "${DIM}" "$quality" "${RESET}" \
-                        "$playing_marker" \
-                        "$vu_segment"
+                        "$playing_marker"
+                    OUT+="$_f"$'\033[K'
+                    if [[ $is_playing -eq 1 ]] && [[ -n "$WAVE_DISPLAY_TOP" ]]; then
+                        printf -v _f '\033[%dG%s' "$WAVE_COL" "$WAVE_DISPLAY_TOP"
+                        OUT+="$_f"
+                    fi
+                    if [[ $is_playing -eq 1 ]] && [[ -n "$WAVE_DISPLAY_BOT" ]]; then
+                        ((RENDER_ROW++))
+                        move_to "$RENDER_ROW" 1
+                        OUT+=$'\033[K'
+                        printf -v _f '\033[%dG%s' "$WAVE_COL" "$WAVE_DISPLAY_BOT"
+                        OUT+="$_f"
+                    fi
                 fi
                 ((RENDER_ROW++))
             done
@@ -467,8 +516,9 @@ render_list() {
 }
 
 render() {
-    read_audio_level
-    format_vu_meter
+    OUT=""
+    ((FRAME_COUNT++))
+    read_waveform
 
     RENDER_ROW=1
     render_header
@@ -477,6 +527,7 @@ render() {
 
     erase_below "$RENDER_ROW"
     render_footer
+    printf '%s' "$OUT"
 }
 
 # ---------------------------------------------------------------------------
@@ -606,6 +657,11 @@ handle_input() {
 # Cleanup
 # ---------------------------------------------------------------------------
 cleanup() {
+    if [[ -n "$TIMER_PID" ]] && kill -0 "$TIMER_PID" 2>/dev/null; then
+        kill "$TIMER_PID" 2>/dev/null
+        wait "$TIMER_PID" 2>/dev/null
+    fi
+    TIMER_PID=""
     stop_playback
     show_cursor
     if [[ -n "$SAVED_STTY" ]]; then
@@ -613,8 +669,8 @@ cleanup() {
     else
         stty sane 2>/dev/null
     fi
-    if [[ -n "$LEVEL_FILE" ]] && [[ -f "$LEVEL_FILE" ]]; then
-        rm -f "$LEVEL_FILE"
+    if [[ -n "$DISPLAY_FILE" ]]; then
+        rm -f "$DISPLAY_FILE" "${DISPLAY_FILE}.tmp" "${DISPLAY_FILE}.pid" "${DISPLAY_FILE}.pl" 2>/dev/null
     fi
     clear_screen
     printf 'radio: goodbye\n'
@@ -723,16 +779,61 @@ main() {
         fi
     fi
 
-    LEVEL_FILE=$(mktemp /tmp/radio_levels.XXXXXX)
+    DISPLAY_FILE=$(mktemp /tmp/radio_wave.XXXXXX)
+    WAVE_SCRIPT="${DISPLAY_FILE}.pl"
+    printf '%s' '
+        binmode(STDIN);
+        my $df = $ARGV[0];
+        my $spp = 120;
+        my @tlf = (0,0x40,0x44,0x46,0x47);
+        my @trf = (0,0x80,0xA0,0xB0,0xB8);
+        my @blf = (0,0x01,0x03,0x07,0x47);
+        my @brf = (0,0x08,0x18,0x38,0xB8);
+        my $tbuf = "";
+        my $bbuf = "";
+        my @s;
+        while (sysread(STDIN, my $raw, 4096)) {
+            push @s, unpack("C*", $raw);
+            my $changed = 0;
+            while (@s >= $spp) {
+                my @c = splice(@s, 0, $spp);
+                my $h = int($spp / 2);
+                my ($pl, $pr) = (0, 0);
+                for (0..$h-1) { my $a = abs($c[$_]-128); $pl=$a if $a>$pl }
+                for ($h..$#c) { my $a = abs($c[$_]-128); $pr=$a if $a>$pr }
+                my $ll = int($pl*4/80); $ll=4 if $ll>4;
+                my $rl = int($pr*4/80); $rl=4 if $rl>4;
+                my $to = $tlf[$ll] + $trf[$rl];
+                my $bo = $blf[$ll] + $brf[$rl];
+                $tbuf .= chr(226).chr(160+int($to/64)).chr(128+($to%64));
+                $bbuf .= chr(226).chr(160+int($bo/64)).chr(128+($bo%64));
+                if (length($tbuf) > 600) { $tbuf = substr($tbuf, -600) }
+                if (length($bbuf) > 600) { $bbuf = substr($bbuf, -600) }
+                $changed = 1;
+            }
+            if ($changed) {
+                if (open(my $fh, ">:raw", "$df.tmp")) {
+                    print $fh $tbuf, "\n", $bbuf;
+                    close($fh);
+                    rename("$df.tmp", $df);
+                }
+            }
+        }
+    ' > "$WAVE_SCRIPT"
 
     trap cleanup EXIT
-    trap render WINCH
+    trap 'RESIZE_PENDING=1' WINCH
+    trap : ALRM
+    (while kill -0 $$ 2>/dev/null; do sleep 0.03; kill -ALRM $$ 2>/dev/null; done) &
+    TIMER_PID=$!
 
     SAVED_STTY=$(stty -g 2>/dev/null)
     stty -echo -icanon 2>/dev/null
 
     get_volume
     expand_current_category
+    update_terminal_size
+    calculate_vu_width
     hide_cursor
     clear_screen
     render
@@ -741,6 +842,12 @@ main() {
         check_playback
         if ! handle_input; then
             break
+        fi
+        if [[ $RESIZE_PENDING -eq 1 ]]; then
+            RESIZE_PENDING=0
+            update_terminal_size
+            calculate_vu_width
+            clear_screen
         fi
         render
     done
