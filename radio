@@ -1,0 +1,749 @@
+#!/usr/bin/env bash
+# radio -- Interactive terminal radio streaming utility
+# Requires: ffmpeg (ffplay for direct mode, ffmpeg for TUI mode)
+
+set -o pipefail
+
+# ---------------------------------------------------------------------------
+# Station database (parallel indexed arrays for bash 3.2 compatibility)
+# ---------------------------------------------------------------------------
+STATION_NAMES=()
+STATION_URLS=()
+STATION_CATEGORIES=()
+STATION_DESCS=()
+STATION_QUALITY=()
+
+add_station() {
+    STATION_NAMES+=("$1")
+    STATION_URLS+=("$2")
+    STATION_CATEGORIES+=("$3")
+    STATION_DESCS+=("$4")
+    STATION_QUALITY+=("$5")
+}
+
+# BBC
+add_station "BBC 6 Music" \
+    "https://as-hls-ww.live.cf.md.bbci.co.uk/pool_81827798/live/ww/bbc_6music/bbc_6music.isml/bbc_6music-audio=320000.norewind.m3u8" \
+    "BBC" "Alternative music station" "AAC 320k"
+
+# FIP
+add_station "FIP" \
+    "https://icecast.radiofrance.fr/fip-hifi.aac" \
+    "FIP" "Eclectic French public radio" "AAC Hi-Fi"
+add_station "FIP Rock" \
+    "https://icecast.radiofrance.fr/fiprock-hifi.aac" \
+    "FIP" "Rock from all eras" "AAC Hi-Fi"
+add_station "FIP Jazz" \
+    "https://icecast.radiofrance.fr/fipjazz-hifi.aac" \
+    "FIP" "Jazz standards and discoveries" "AAC Hi-Fi"
+add_station "FIP Groove" \
+    "https://icecast.radiofrance.fr/fipgroove-hifi.aac" \
+    "FIP" "Funk, soul, and groove" "AAC Hi-Fi"
+add_station "FIP Pop" \
+    "https://icecast.radiofrance.fr/fippop-hifi.aac" \
+    "FIP" "Pop music selections" "AAC Hi-Fi"
+add_station "FIP Electro" \
+    "https://icecast.radiofrance.fr/fipelectro-hifi.aac" \
+    "FIP" "Electronic music" "AAC Hi-Fi"
+add_station "FIP Monde" \
+    "https://icecast.radiofrance.fr/fipmonde-hifi.aac" \
+    "FIP" "World music" "AAC Hi-Fi"
+add_station "FIP Reggae" \
+    "https://icecast.radiofrance.fr/fipreggae-hifi.aac" \
+    "FIP" "Reggae and dub" "AAC Hi-Fi"
+add_station "FIP Nouveautes" \
+    "https://icecast.radiofrance.fr/fipnouveautes-hifi.aac" \
+    "FIP" "New releases" "AAC Hi-Fi"
+add_station "FIP Metal" \
+    "https://icecast.radiofrance.fr/fipmetal-hifi.aac" \
+    "FIP" "Metal and heavy music" "AAC Hi-Fi"
+
+# France Musique
+add_station "France Musique" \
+    "https://icecast.radiofrance.fr/francemusique-hifi.aac" \
+    "France Musique" "Classical and jazz" "AAC Hi-Fi"
+
+# KALX
+add_station "KALX" \
+    "https://stream.kalx.berkeley.edu:8443/kalx-128.mp3" \
+    "KALX" "UC Berkeley college radio" "MP3 128k"
+
+# KCRW
+add_station "KCRW Eclectic 24" \
+    "https://streams.kcrw.com/e24_aac" \
+    "KCRW" "24/7 hand-picked music" "AAC"
+add_station "KCRW Live" \
+    "https://streams.kcrw.com/kcrw_aac" \
+    "KCRW" "Live simulcast" "AAC"
+
+# KEXP
+add_station "KEXP" \
+    "https://kexp.streamguys1.com/kexp160.aac" \
+    "KEXP" "Seattle's independent radio" "AAC 160k"
+
+# NTS
+add_station "NTS 1" \
+    "https://stream-relay-geo.ntslive.net/stream" \
+    "NTS" "London-based internet radio, channel 1" "MP3 192k"
+add_station "NTS 2" \
+    "https://stream-relay-geo.ntslive.net/stream2" \
+    "NTS" "London-based internet radio, channel 2" "MP3 192k"
+
+# WFMU
+add_station "WFMU" \
+    "http://stream0.wfmu.org/freeform-128k" \
+    "WFMU" "Freeform radio from Jersey City" "MP3 128k"
+
+# ---------------------------------------------------------------------------
+# Globals
+# ---------------------------------------------------------------------------
+CURRENT_PID=""
+CURRENT_STATION_INDEX=""
+CATEGORY_CURSOR=0
+STATION_CURSOR=-1  # -1 = on category header, 0+ = station index within expanded list
+RECONNECT_ATTEMPTS=0
+MAX_RECONNECT=3
+CATEGORY_LIST=()
+EXPANDED_STATIONS=()
+SAVED_STTY=""
+VOLUME=""
+LEVEL_FILE=""
+VU_BUFFER=""
+VU_DISPLAY=""
+RENDER_ROW=0
+PAUSED=0
+
+VU_BLOCKS=(" " "▁" "▂" "▃" "▄" "▅" "▆" "▇")
+
+# Terminal colors and formatting
+BOLD=$'\033[1m'
+DIM=$'\033[2m'
+REVERSE=$'\033[7m'
+RESET=$'\033[0m'
+CYAN=$'\033[36m'
+GREEN=$'\033[32m'
+YELLOW=$'\033[33m'
+MAGENTA=$'\033[35m'
+WHITE=$'\033[37m'
+BLUE=$'\033[34m'
+
+# ---------------------------------------------------------------------------
+# Utility functions
+# ---------------------------------------------------------------------------
+get_terminal_width() {
+    local cols
+    cols=$(tput cols 2>/dev/null) || cols=80
+    echo "$cols"
+}
+
+get_terminal_height() {
+    local rows
+    rows=$(tput lines 2>/dev/null) || rows=24
+    echo "$rows"
+}
+
+hide_cursor() { printf '\033[?25l'; }
+show_cursor() { printf '\033[?25h'; }
+clear_screen() { printf '\033[2J\033[H'; }
+move_to() { printf '\033[%d;%dH' "$1" "$2"; }
+
+draw_horizontal_line() {
+    local width="$1"
+    local i
+    local line=""
+    for ((i = 0; i < width; i++)); do
+        line+="─"
+    done
+    printf '%s' "$line"
+}
+
+erase_below() {
+    local from_row=$1
+    local height
+    height=$(get_terminal_height)
+    local row
+    for ((row = from_row; row < height; row++)); do
+        move_to "$row" 1
+        printf '\033[K'
+    done
+}
+
+build_category_list() {
+    CATEGORY_LIST=()
+    local i seen
+    for i in "${!STATION_CATEGORIES[@]}"; do
+        seen=0
+        for existing in "${CATEGORY_LIST[@]}"; do
+            if [[ "$existing" == "${STATION_CATEGORIES[$i]}" ]]; then
+                seen=1
+                break
+            fi
+        done
+        if [[ $seen -eq 0 ]]; then
+            CATEGORY_LIST+=("${STATION_CATEGORIES[$i]}")
+        fi
+    done
+}
+
+expand_current_category() {
+    EXPANDED_STATIONS=()
+    local category="${CATEGORY_LIST[$CATEGORY_CURSOR]}"
+    local i
+    for i in "${!STATION_CATEGORIES[@]}"; do
+        if [[ "${STATION_CATEGORIES[$i]}" == "$category" ]]; then
+            EXPANDED_STATIONS+=("$i")
+        fi
+    done
+}
+
+count_category_stations() {
+    local category="$1"
+    local count=0
+    local i
+    for i in "${!STATION_CATEGORIES[@]}"; do
+        if [[ "${STATION_CATEGORIES[$i]}" == "$category" ]]; then
+            ((count++))
+        fi
+    done
+    echo "$count"
+}
+
+# ---------------------------------------------------------------------------
+# Volume control (macOS system volume via osascript)
+# ---------------------------------------------------------------------------
+get_volume() {
+    VOLUME=$(osascript -e "output volume of (get volume settings)" 2>/dev/null)
+    if [[ -z "$VOLUME" ]] || [[ "$VOLUME" == "missing value" ]]; then
+        VOLUME=50
+    fi
+}
+
+adjust_volume() {
+    local delta=$1
+    local new_vol=$((VOLUME + delta))
+    if [[ $new_vol -lt 0 ]]; then new_vol=0; fi
+    if [[ $new_vol -gt 100 ]]; then new_vol=100; fi
+    osascript -e "set volume output volume $new_vol" 2>/dev/null &
+    VOLUME=$new_vol
+}
+
+# ---------------------------------------------------------------------------
+# VU meter
+# ---------------------------------------------------------------------------
+read_audio_level() {
+    if [[ -z "$CURRENT_PID" ]] || [[ ! -s "$LEVEL_FILE" ]]; then
+        return
+    fi
+    local last_rms
+    last_rms=$(tail -5 "$LEVEL_FILE" 2>/dev/null | grep "RMS_level" | tail -1)
+    if [[ -z "$last_rms" ]]; then
+        return
+    fi
+    local db_str="${last_rms##*=}"
+    local level=0
+    if [[ "$db_str" == "-inf" ]] || [[ "$db_str" == "inf" ]]; then
+        level=0
+    else
+        local db_int="${db_str%%.*}"
+        if [[ $db_int -ge -10 ]]; then level=7
+        elif [[ $db_int -ge -18 ]]; then level=6
+        elif [[ $db_int -ge -25 ]]; then level=5
+        elif [[ $db_int -ge -30 ]]; then level=4
+        elif [[ $db_int -ge -40 ]]; then level=3
+        elif [[ $db_int -ge -50 ]]; then level=2
+        elif [[ $db_int -ge -60 ]]; then level=1
+        fi
+    fi
+    VU_BUFFER="${VU_BUFFER}${level}"
+    if [[ ${#VU_BUFFER} -gt 20 ]]; then
+        VU_BUFFER="${VU_BUFFER:$((${#VU_BUFFER}-20))}"
+    fi
+}
+
+format_vu_meter() {
+    VU_DISPLAY=""
+    if [[ -z "$VU_BUFFER" ]] || [[ -z "$CURRENT_PID" ]]; then
+        return
+    fi
+    local result=""
+    local i level
+    for ((i = 0; i < ${#VU_BUFFER}; i++)); do
+        level="${VU_BUFFER:$i:1}"
+        result+="${VU_BLOCKS[$level]}"
+    done
+    VU_DISPLAY="${GREEN}${result}${RESET}"
+}
+
+# ---------------------------------------------------------------------------
+# Playback (ffmpeg with astats for VU data, audiotoolbox for audio output)
+# ---------------------------------------------------------------------------
+stop_playback() {
+    if [[ -n "$CURRENT_PID" ]] && kill -0 "$CURRENT_PID" 2>/dev/null; then
+        if [[ $PAUSED -eq 1 ]]; then
+            kill -CONT "$CURRENT_PID" 2>/dev/null
+        fi
+        kill "$CURRENT_PID" 2>/dev/null
+        wait "$CURRENT_PID" 2>/dev/null
+    fi
+    CURRENT_PID=""
+    RECONNECT_ATTEMPTS=0
+    PAUSED=0
+    VU_BUFFER=""
+    VU_DISPLAY=""
+    if [[ -n "$LEVEL_FILE" ]] && [[ -f "$LEVEL_FILE" ]]; then
+        : > "$LEVEL_FILE"
+    fi
+}
+
+toggle_pause() {
+    if [[ -z "$CURRENT_PID" ]] || ! kill -0 "$CURRENT_PID" 2>/dev/null; then
+        return
+    fi
+    if [[ $PAUSED -eq 0 ]]; then
+        kill -STOP "$CURRENT_PID" 2>/dev/null
+        PAUSED=1
+    else
+        kill -CONT "$CURRENT_PID" 2>/dev/null
+        PAUSED=0
+    fi
+}
+
+start_playback() {
+    local index="$1"
+    stop_playback
+    local url="${STATION_URLS[$index]}"
+    ffmpeg -loglevel quiet -i "$url" \
+        -af "astats=metadata=1:reset=1,ametadata=print:key=lavfi.astats.Overall.RMS_level:file=$LEVEL_FILE" \
+        -f audiotoolbox - 2>/dev/null &
+    CURRENT_PID=$!
+    CURRENT_STATION_INDEX="$index"
+    RECONNECT_ATTEMPTS=0
+    VU_BUFFER=""
+}
+
+check_playback() {
+    if [[ -n "$CURRENT_PID" ]] && ! kill -0 "$CURRENT_PID" 2>/dev/null; then
+        if [[ $RECONNECT_ATTEMPTS -lt $MAX_RECONNECT ]]; then
+            ((RECONNECT_ATTEMPTS++))
+            local url="${STATION_URLS[$CURRENT_STATION_INDEX]}"
+            ffmpeg -loglevel quiet -i "$url" \
+                -af "astats=metadata=1:reset=1,ametadata=print:key=lavfi.astats.Overall.RMS_level:file=$LEVEL_FILE" \
+                -f audiotoolbox - 2>/dev/null &
+            CURRENT_PID=$!
+        else
+            CURRENT_PID=""
+            CURRENT_STATION_INDEX=""
+            VU_BUFFER=""
+            VU_DISPLAY=""
+        fi
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Rendering (flicker-free: move_to + erase-to-end-of-line, no clear_screen)
+# ---------------------------------------------------------------------------
+render_header() {
+    local width
+    width=$(get_terminal_width)
+    move_to 1 1
+
+    local title=" RADIO"
+    local vol_info=""
+    if [[ -n "$VOLUME" ]]; then
+        vol_info="  Vol: ${VOLUME}"
+    fi
+    local now_playing=""
+    if [[ -n "$CURRENT_STATION_INDEX" ]]; then
+        local pause_indicator=""
+        if [[ $PAUSED -eq 1 ]]; then
+            pause_indicator=" [paused]"
+        fi
+        now_playing="  ${STATION_NAMES[$CURRENT_STATION_INDEX]}${pause_indicator} "
+    fi
+
+    local left="${title}${vol_info}"
+    local right="$now_playing"
+    local padding=$((width - ${#left} - ${#right}))
+    if [[ $padding -lt 0 ]]; then padding=0; fi
+
+    printf '%s' "${REVERSE}${BOLD}"
+    printf '%s' "$left"
+    printf '%*s' "$padding" ""
+    if [[ -n "$right" ]]; then
+        printf '%s%s' "${GREEN}${REVERSE}" "$right"
+    fi
+    printf '%s\033[K' "${RESET}"
+
+    RENDER_ROW=3
+}
+
+render_footer() {
+    local width
+    width=$(get_terminal_width)
+    local height
+    height=$(get_terminal_height)
+    move_to "$height" 1
+
+    local hints=" j/k:nav  enter:select  b:back  s:stop  p:pause  +/-:vol  q:quit"
+
+    local padding=$((width - ${#hints}))
+    if [[ $padding -lt 0 ]]; then padding=0; fi
+
+    printf '%s%s%*s%s' "${REVERSE}${DIM}" "$hints" "$padding" "" "${RESET}"
+}
+
+render_list() {
+    local cat_idx
+    for cat_idx in "${!CATEGORY_LIST[@]}"; do
+        local category="${CATEGORY_LIST[$cat_idx]}"
+        local station_count
+        station_count=$(count_category_stations "$category")
+        local is_current_cat=0
+        if [[ $cat_idx -eq $CATEGORY_CURSOR ]]; then
+            is_current_cat=1
+        fi
+
+        local expand_marker="▸"
+        if [[ $is_current_cat -eq 1 ]]; then
+            expand_marker="▾"
+        fi
+
+        move_to "$RENDER_ROW" 1
+        if [[ $is_current_cat -eq 1 ]] && [[ $STATION_CURSOR -eq -1 ]]; then
+            printf '  %s %s%s %-28s%s  %s%d%s\033[K' \
+                "${CYAN}>${RESET}" \
+                "${BOLD}${WHITE}" "$expand_marker" "$category" "${RESET}" \
+                "${DIM}" "$station_count" "${RESET}"
+        else
+            printf '   %s %-28s  %s%d%s\033[K' \
+                "$expand_marker" "$category" \
+                "${DIM}" "$station_count" "${RESET}"
+        fi
+        ((RENDER_ROW++))
+
+        if [[ $is_current_cat -eq 1 ]]; then
+            local s_idx
+            for s_idx in "${!EXPANDED_STATIONS[@]}"; do
+                local station_idx="${EXPANDED_STATIONS[$s_idx]}"
+                local name="${STATION_NAMES[$station_idx]}"
+                local desc="${STATION_DESCS[$station_idx]}"
+                local quality="${STATION_QUALITY[$station_idx]}"
+                local playing_marker=""
+                local vu_segment=""
+
+                if [[ "$station_idx" == "$CURRENT_STATION_INDEX" ]]; then
+                    if [[ $PAUSED -eq 1 ]]; then
+                        playing_marker="${YELLOW} ▐▐${RESET}"
+                    else
+                        playing_marker="${GREEN} ▶${RESET}"
+                    fi
+                    if [[ -n "$VU_DISPLAY" ]]; then
+                        vu_segment=" ${VU_DISPLAY}"
+                    fi
+                fi
+
+                move_to "$RENDER_ROW" 1
+                if [[ $s_idx -eq $STATION_CURSOR ]]; then
+                    printf '    %s %s%-30s%s %s%-7s%s%s%s\033[K' \
+                        "${CYAN}>${RESET}" \
+                        "${BOLD}${WHITE}" "$name" "${RESET}" \
+                        "${YELLOW}" "$quality" "${RESET}" \
+                        "$playing_marker" \
+                        "$vu_segment"
+                    ((RENDER_ROW++))
+                    move_to "$RENDER_ROW" 1
+                    printf '      %s%s%s\033[K' "${DIM}" "$desc" "${RESET}"
+                else
+                    printf '     %-30s %s%-7s%s%s%s\033[K' \
+                        "$name" \
+                        "${DIM}" "$quality" "${RESET}" \
+                        "$playing_marker" \
+                        "$vu_segment"
+                fi
+                ((RENDER_ROW++))
+            done
+        fi
+    done
+}
+
+render() {
+    read_audio_level
+    format_vu_meter
+
+    RENDER_ROW=1
+    render_header
+
+    render_list
+
+    erase_below "$RENDER_ROW"
+    render_footer
+}
+
+# ---------------------------------------------------------------------------
+# Input handling
+# ---------------------------------------------------------------------------
+KEY_RESULT=""
+
+read_key() {
+    local key seq read_exit
+    IFS= read -rsn1 -t 1 key
+    read_exit=$?
+
+    if [[ $read_exit -ne 0 ]] && [[ -z "$key" ]]; then
+        KEY_RESULT="TIMEOUT"
+        return
+    fi
+
+    if [[ "$key" == $'\x1b' ]]; then
+        IFS= read -rsn1 -t 1 seq
+        if [[ "$seq" == "[" ]]; then
+            IFS= read -rsn1 -t 1 seq
+            case "$seq" in
+                A) KEY_RESULT="UP"; return ;;
+                B) KEY_RESULT="DOWN"; return ;;
+                C) KEY_RESULT="RIGHT"; return ;;
+                D) KEY_RESULT="LEFT"; return ;;
+                Z) KEY_RESULT="BACK"; return ;;
+            esac
+        fi
+        KEY_RESULT="ESCAPE"
+        return
+    fi
+
+    case "$key" in
+        k) KEY_RESULT="UP" ;;
+        j) KEY_RESULT="DOWN" ;;
+        q) KEY_RESULT="QUIT" ;;
+        b) KEY_RESULT="BACK" ;;
+        s) KEY_RESULT="STOP" ;;
+        p) KEY_RESULT="PAUSE" ;;
+        $'\t') KEY_RESULT="TAB" ;;
+        +|=) KEY_RESULT="VOL_UP" ;;
+        -) KEY_RESULT="VOL_DOWN" ;;
+        ""|$'\n'|$'\r') KEY_RESULT="ENTER" ;;
+        *) KEY_RESULT="OTHER" ;;
+    esac
+}
+
+handle_input() {
+    read_key
+    local max_cat=$(( ${#CATEGORY_LIST[@]} - 1 ))
+    local max_station=$(( ${#EXPANDED_STATIONS[@]} - 1 ))
+
+    case "$KEY_RESULT" in
+        UP)
+            if [[ $STATION_CURSOR -gt 0 ]]; then
+                ((STATION_CURSOR--))
+            elif [[ $STATION_CURSOR -eq 0 ]]; then
+                STATION_CURSOR=-1
+            elif [[ $CATEGORY_CURSOR -gt 0 ]]; then
+                ((CATEGORY_CURSOR--))
+                expand_current_category
+            fi
+            ;;
+        DOWN)
+            if [[ $STATION_CURSOR -ge 0 ]]; then
+                if [[ $STATION_CURSOR -lt $max_station ]]; then
+                    ((STATION_CURSOR++))
+                else
+                    STATION_CURSOR=-1
+                    if [[ $CATEGORY_CURSOR -lt $max_cat ]]; then
+                        ((CATEGORY_CURSOR++))
+                        expand_current_category
+                    else
+                        STATION_CURSOR=$max_station
+                    fi
+                fi
+            elif [[ $CATEGORY_CURSOR -lt $max_cat ]]; then
+                ((CATEGORY_CURSOR++))
+                expand_current_category
+            fi
+            ;;
+        TAB)
+            if [[ $STATION_CURSOR -eq -1 ]]; then
+                STATION_CURSOR=0
+            elif [[ $STATION_CURSOR -lt $max_station ]]; then
+                ((STATION_CURSOR++))
+            else
+                STATION_CURSOR=-1
+            fi
+            ;;
+        ENTER)
+            if [[ $STATION_CURSOR -eq -1 ]]; then
+                start_playback "${EXPANDED_STATIONS[0]}"
+            else
+                start_playback "${EXPANDED_STATIONS[$STATION_CURSOR]}"
+            fi
+            ;;
+        BACK)
+            if [[ $STATION_CURSOR -ge 0 ]]; then
+                STATION_CURSOR=-1
+            fi
+            ;;
+        STOP)
+            stop_playback
+            CURRENT_STATION_INDEX=""
+            ;;
+        PAUSE)
+            toggle_pause
+            ;;
+        VOL_UP)
+            adjust_volume 5
+            ;;
+        VOL_DOWN)
+            adjust_volume -5
+            ;;
+        TIMEOUT)
+            ;;
+        QUIT)
+            return 1
+            ;;
+    esac
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Cleanup
+# ---------------------------------------------------------------------------
+cleanup() {
+    stop_playback
+    show_cursor
+    if [[ -n "$SAVED_STTY" ]]; then
+        stty "$SAVED_STTY" 2>/dev/null
+    else
+        stty sane 2>/dev/null
+    fi
+    if [[ -n "$LEVEL_FILE" ]] && [[ -f "$LEVEL_FILE" ]]; then
+        rm -f "$LEVEL_FILE"
+    fi
+    clear_screen
+    printf 'radio: goodbye\n'
+}
+
+# ---------------------------------------------------------------------------
+# Fuzzy match for direct play from CLI
+# ---------------------------------------------------------------------------
+fuzzy_match_station() {
+    local query
+    query=$(echo "$1" | tr '[:upper:]' '[:lower:]')
+    local i
+
+    for i in "${!STATION_NAMES[@]}"; do
+        local name
+        name=$(echo "${STATION_NAMES[$i]}" | tr '[:upper:]' '[:lower:]')
+        if [[ "$name" == "$query" ]]; then
+            echo "$i"
+            return 0
+        fi
+    done
+
+    for i in "${!STATION_NAMES[@]}"; do
+        local name
+        name=$(echo "${STATION_NAMES[$i]}" | tr '[:upper:]' '[:lower:]')
+        if [[ "$name" == *"$query"* ]]; then
+            echo "$i"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+print_station_list() {
+    local current_category=""
+    local i
+    for i in "${!STATION_NAMES[@]}"; do
+        if [[ "${STATION_CATEGORIES[$i]}" != "$current_category" ]]; then
+            current_category="${STATION_CATEGORIES[$i]}"
+            printf '\n%s%s%s\n' "${BOLD}" "$current_category" "${RESET}"
+        fi
+        printf '  %-36s %s%-10s%s  %s\n' \
+            "${STATION_NAMES[$i]}" \
+            "${DIM}" "${STATION_QUALITY[$i]}" "${RESET}" \
+            "${STATION_DESCS[$i]}"
+    done
+    printf '\n'
+}
+
+# ---------------------------------------------------------------------------
+# Direct play mode (non-interactive, uses ffplay)
+# ---------------------------------------------------------------------------
+direct_play() {
+    local index="$1"
+    local name="${STATION_NAMES[$index]}"
+    local quality="${STATION_QUALITY[$index]}"
+    local url="${STATION_URLS[$index]}"
+
+    printf '%sPlaying:%s %s  %s[%s]%s\n' \
+        "${BOLD}" "${RESET}" "$name" "${DIM}" "$quality" "${RESET}"
+    printf '%sPress Ctrl+C to stop%s\n' "${DIM}" "${RESET}"
+
+    trap 'printf "\n"; exit 0' INT TERM
+    ffplay -nodisp -loglevel quiet "$url" 2>/dev/null
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+main() {
+    if ! command -v ffmpeg &>/dev/null; then
+        printf 'radio: ffmpeg not found. Install ffmpeg first.\n' >&2
+        printf '  brew install ffmpeg\n' >&2
+        exit 1
+    fi
+
+    build_category_list
+
+    if [[ "$1" == "--list" || "$1" == "-l" ]]; then
+        print_station_list
+        exit 0
+    fi
+
+    if [[ "$1" == "--help" || "$1" == "-h" ]]; then
+        printf 'Usage: radio [station-name | --list | --help]\n\n'
+        printf 'Interactive terminal radio player.\n\n'
+        printf 'Options:\n'
+        printf '  (no args)       Launch interactive TUI\n'
+        printf '  <station-name>  Play station directly (fuzzy match)\n'
+        printf '  --list, -l      List all available stations\n'
+        printf '  --help, -h      Show this help message\n'
+        exit 0
+    fi
+
+    if [[ -n "$1" ]]; then
+        local match
+        match=$(fuzzy_match_station "$*")
+        if [[ $? -eq 0 && -n "$match" ]]; then
+            direct_play "$match"
+            exit 0
+        else
+            printf 'radio: no station matching "%s"\n' "$*" >&2
+            printf 'Try: radio --list\n' >&2
+            exit 1
+        fi
+    fi
+
+    LEVEL_FILE=$(mktemp /tmp/radio_levels.XXXXXX)
+
+    trap cleanup EXIT
+    trap render WINCH
+
+    SAVED_STTY=$(stty -g 2>/dev/null)
+    stty -echo -icanon 2>/dev/null
+
+    get_volume
+    expand_current_category
+    hide_cursor
+    clear_screen
+    render
+
+    while true; do
+        check_playback
+        if ! handle_input; then
+            break
+        fi
+        render
+    done
+}
+
+main "$@"
