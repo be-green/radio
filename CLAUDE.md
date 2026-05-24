@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-`radio` is an interactive terminal radio streaming utility for macOS. The current implementation is a Rust binary (`src/main.rs`); the original bash version (`./radio`) is preserved for reference but no longer the primary path.
+`radio` is an interactive terminal radio streaming utility for macOS, implemented as a Rust binary (`src/main.rs`). It was originally a bash script, which was rewritten in Rust (see "Why the rewrite" below) and has since been removed.
 
 ## Building & running
 
@@ -63,7 +63,3 @@ macOS-only via `osascript`. `get_volume()` parses `output volume of (get volume 
 ## Adding stations
 
 Append to the `STATIONS` const slice. Categories group automatically — `App::new()` derives the category list and counts in insertion order.
-
-## The legacy bash version
-
-`./radio` (the bash script) is still in the repo. It works, but will eventually segfault (see "Why the rewrite"). Keep it around for reference; don't extend it.

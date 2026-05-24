@@ -1,7 +1,7 @@
 # radio
 
 An interactive terminal radio player for macOS. Browse a curated set of stations
-(BBC, FIP, KEXP, KCRW, NTS, WFMU, and more) in a TUI, with a live Braille
+(BBC, FIP, KEXP, KCRW, NTS, WFMU, and more) in a TUI, with a live
 waveform meter next to the playing station, pause/resume, and volume control.
 
 It's a single ~640 KB Rust binary that shells out to `ffmpeg` for streaming and
@@ -77,11 +77,3 @@ radio --help          # show usage
 Stations live in the `STATIONS` const slice at the top of `src/main.rs`. Append a
 `Station { name, url, category, desc, quality }` entry and rebuild — categories
 are derived automatically from the `category` field in insertion order.
-
-## Notes
-
-- A legacy bash version (`./radio`) is kept in the repo for reference but is no
-  longer the primary path; see [CLAUDE.md](CLAUDE.md) for why it was rewritten in
-  Rust and how the binary is structured.
-</content>
-</invoke>
